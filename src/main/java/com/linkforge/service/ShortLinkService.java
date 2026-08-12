@@ -23,7 +23,8 @@ public class ShortLinkService {
     @Autowired
     private StringRedisTemplate stringRedisTemplate;
 
-    private static final String SHORT_LINK_KEY_PREFIX = "shortLink";//短链接缓存前缀
+    private static final String SHORT_LINK_KEY_PREFIX = "short_link:";//短链接缓存前缀
+    private static final String NULL_VALUE = "__NULL__";
 
     // 1. 生成短链接
     @Transactional
@@ -64,8 +65,7 @@ public class ShortLinkService {
             throw new BizException(404, "短链接不存在或已失效");
         }
         return shortLink.getOriginUrl();
-    }*/
-    public String getOriginUrl(String shortCode) {
+    }*/public String getOriginUrl(String shortCode) {
 
         // 1. Redis Key
         String redisKey = SHORT_LINK_KEY_PREFIX + shortCode;
@@ -77,17 +77,27 @@ public class ShortLinkService {
 
         // 3. Redis 命中
         if (StringUtils.hasText(originUrl)) {
+
+            // 3.1 命中的是“空值标记”
+            if (NULL_VALUE.equals(originUrl)) {
+                System.out.println("====== Redis 命中：空值 ======");
+                System.out.println("shortCode: " + shortCode);
+
+                throw new BizException(404, "短链接不存在或已失效");
+            }
+
+            // 3.2 命中正常 URL
             System.out.println("====== Redis 命中 ======");
             System.out.println("shortCode: " + shortCode);
             System.out.println("originUrl: " + originUrl);
+
             return originUrl;
         }
 
-        //Redis 未命中，查询 MySQL
+        // 4. Redis 未命中，查询 MySQL
         System.out.println("====== Redis 未命中，查询 MySQL ======");
         System.out.println("shortCode: " + shortCode);
 
-        // 4. Redis 未命中，查询 MySQL
         LambdaQueryWrapper<ShortLink> wrapper = new LambdaQueryWrapper<>();
         wrapper.eq(ShortLink::getShortCode, shortCode);
 
@@ -95,10 +105,23 @@ public class ShortLinkService {
 
         // 5. MySQL 也不存在
         if (shortLink == null) {
+
+            System.out.println("====== MySQL 不存在，写入 Redis 空值 ======");
+            System.out.println("shortCode: " + shortCode);
+
+            // 缓存空值 60 秒
+            stringRedisTemplate.opsForValue()
+                    .set(
+                            redisKey,
+                            NULL_VALUE,
+                            60,
+                            TimeUnit.SECONDS
+                    );
+
             throw new BizException(404, "短链接不存在或已失效");
         }
 
-        // 6. 回写 Redis
+        // 6. MySQL 查询成功，写入 Redis
         stringRedisTemplate.opsForValue()
                 .set(
                         redisKey,
@@ -106,6 +129,10 @@ public class ShortLinkService {
                         7,
                         TimeUnit.DAYS
                 );
+
+        System.out.println("====== MySQL 查询成功，写入 Redis ======");
+        System.out.println("shortCode: " + shortCode);
+        System.out.println("originUrl: " + shortLink.getOriginUrl());
 
         // 7. 返回原始 URL
         return shortLink.getOriginUrl();
