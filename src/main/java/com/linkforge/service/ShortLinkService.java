@@ -7,11 +7,14 @@ import com.linkforge.exception.BizException;
 import com.linkforge.mapper.ShortLinkMapper;
 import com.linkforge.utils.Base62Utils;
 import com.linkforge.vo.ShortLinkVO;
+import jakarta.annotation.PostConstruct;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.util.StringUtils;
+
 
 import java.util.concurrent.TimeUnit;
 
@@ -22,6 +25,9 @@ public class ShortLinkService {
 
     @Autowired
     private StringRedisTemplate stringRedisTemplate;
+
+    @Autowired
+    private RedissonClient redissonClient;
 
     private static final String SHORT_LINK_KEY_PREFIX = "short_link:";//短链接缓存前缀
     private static final String NULL_VALUE = "__NULL__";
@@ -56,16 +62,7 @@ public class ShortLinkService {
     }
 
     // 2. 根据短码获取长网址
-    /*public String getOriginUrl(String shortCode) {
-        LambdaQueryWrapper<ShortLink> wrapper = new LambdaQueryWrapper<>();
-        wrapper.eq(ShortLink::getShortCode, shortCode);
-        ShortLink shortLink = shortLinkMapper.selectOne(wrapper);
-
-        if (shortLink == null) {
-            throw new BizException(404, "短链接不存在或已失效");
-        }
-        return shortLink.getOriginUrl();
-    }*/public String getOriginUrl(String shortCode) {
+    public String getOriginUrl(String shortCode) {
 
         // 1. Redis Key
         String redisKey = SHORT_LINK_KEY_PREFIX + shortCode;
@@ -76,9 +73,9 @@ public class ShortLinkService {
                 .get(redisKey);
 
         // 3. Redis 命中
-        if (StringUtils.hasText(originUrl)) {
+        if (originUrl != null) {
 
-            // 3.1 命中的是“空值标记”
+            // 命中空值缓存
             if (NULL_VALUE.equals(originUrl)) {
                 System.out.println("====== Redis 命中：空值 ======");
                 System.out.println("shortCode: " + shortCode);
@@ -86,7 +83,7 @@ public class ShortLinkService {
                 throw new BizException(404, "短链接不存在或已失效");
             }
 
-            // 3.2 命中正常 URL
+            // 正常命中
             System.out.println("====== Redis 命中 ======");
             System.out.println("shortCode: " + shortCode);
             System.out.println("originUrl: " + originUrl);
@@ -94,48 +91,123 @@ public class ShortLinkService {
             return originUrl;
         }
 
-        // 4. Redis 未命中，查询 MySQL
-        System.out.println("====== Redis 未命中，查询 MySQL ======");
+        // 4. Redis 未命中
+        System.out.println("====== Redis 未命中 ======");
         System.out.println("shortCode: " + shortCode);
 
-        LambdaQueryWrapper<ShortLink> wrapper = new LambdaQueryWrapper<>();
-        wrapper.eq(ShortLink::getShortCode, shortCode);
+        // 5. 获取分布式锁
+        String lockKey = "lock:short_link:" + shortCode;
+        RLock lock = redissonClient.getLock(lockKey);
 
-        ShortLink shortLink = shortLinkMapper.selectOne(wrapper);
+        try {
 
-        // 5. MySQL 也不存在
-        if (shortLink == null) {
+            // 6. 尝试获取锁
+            boolean locked = lock.tryLock(3, 10, TimeUnit.SECONDS);
+            System.out.println("====== 尝试获取分布式锁 ======");
+            System.out.println("shortCode: " + shortCode);
+            System.out.println("线程: " + Thread.currentThread().getName());
 
-            System.out.println("====== MySQL 不存在，写入 Redis 空值 ======");
+            if (!locked) {
+                System.out.println("====== 获取分布式锁失败 ======");
+                System.out.println("shortCode: " + shortCode);
+
+                throw new BizException(429, "系统繁忙，请稍后重试");
+            }
+
+            System.out.println("====== 成功获取分布式锁 ======");
+            System.out.println("shortCode: " + shortCode);
+            System.out.println("线程: " + Thread.currentThread().getName());
+
+            // 7. Double Check
+            originUrl = stringRedisTemplate
+                    .opsForValue()
+                    .get(redisKey);
+
+            if (originUrl != null) {
+
+                System.out.println("====== Double Check：Redis 已有数据 ======");
+                System.out.println("shortCode: " + shortCode);
+
+                if (NULL_VALUE.equals(originUrl)) {
+                    throw new BizException(404, "短链接不存在或已失效");
+                }
+
+                System.out.println("originUrl: " + originUrl);
+
+                return originUrl;
+            }
+
+            // 8. Redis 依然没有 → 查询 MySQL
+            System.out.println("====== Redis 未命中，查询 MySQL ======");
             System.out.println("shortCode: " + shortCode);
 
-            // 缓存空值 60 秒
+            LambdaQueryWrapper<ShortLink> wrapper =
+                    new LambdaQueryWrapper<>();
+
+            wrapper.eq(ShortLink::getShortCode, shortCode);
+
+            ShortLink shortLink =
+                    shortLinkMapper.selectOne(wrapper);
+
+            // 9. MySQL 不存在
+            if (shortLink == null) {
+
+                System.out.println("====== MySQL 不存在，写入 Redis 空值 ======");
+                System.out.println("shortCode: " + shortCode);
+
+                // 防止缓存穿透
+                stringRedisTemplate.opsForValue()
+                        .set(
+                                redisKey,
+                                NULL_VALUE,
+                                5,
+                                TimeUnit.MINUTES
+                        );
+
+                throw new BizException(
+                        404,
+                        "短链接不存在或已失效"
+                );
+            }
+
+            // 10. MySQL 查询成功
+            originUrl = shortLink.getOriginUrl();
+
+            System.out.println("====== MySQL 查询成功，写入 Redis ======");
+            System.out.println("shortCode: " + shortCode);
+            System.out.println("originUrl: " + originUrl);
+
             stringRedisTemplate.opsForValue()
                     .set(
                             redisKey,
-                            NULL_VALUE,
-                            60,
-                            TimeUnit.SECONDS
+                            originUrl,
+                            7,
+                            TimeUnit.DAYS
                     );
 
-            throw new BizException(404, "短链接不存在或已失效");
+            return originUrl;
+
+        } catch (InterruptedException e) {
+
+            Thread.currentThread().interrupt();
+
+            throw new BizException(
+                    500,
+                    "获取短链接失败"
+            );
+
+        } finally {
+
+            // 11. 释放分布式锁
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
         }
-
-        // 6. MySQL 查询成功，写入 Redis
-        stringRedisTemplate.opsForValue()
-                .set(
-                        redisKey,
-                        shortLink.getOriginUrl(),
-                        7,
-                        TimeUnit.DAYS
-                );
-
-        System.out.println("====== MySQL 查询成功，写入 Redis ======");
-        System.out.println("shortCode: " + shortCode);
-        System.out.println("originUrl: " + shortLink.getOriginUrl());
-
-        // 7. 返回原始 URL
-        return shortLink.getOriginUrl();
     }
+
+   /* @PostConstruct
+    public void test() {
+        System.out.println(redissonClient);
+    }*/
 
 }

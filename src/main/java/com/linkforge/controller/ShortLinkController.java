@@ -51,7 +51,7 @@ public class ShortLinkController {
    }
 
     //核心 302 重定向跳转接口
-    @GetMapping("/{shortCode:[0-9a-zA-Z]+}}")
+    @GetMapping("/{shortCode:[0-9a-zA-Z]+}")
     public void redirect(@PathVariable String shortCode, HttpServletResponse response)throws IOException {
        /* //TODD: 后面从Redis/Mysql里面根据shortCode 查出 originUrl
         String targetUrl = "https://www.baidu.com"; // 假数据测试
