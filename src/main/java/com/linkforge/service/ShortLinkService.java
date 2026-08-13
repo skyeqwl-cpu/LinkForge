@@ -23,6 +23,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.format.DateTimeFormatter;
 import java.util.List;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
@@ -44,7 +45,15 @@ public class ShortLinkService {
     private static final String CLICK_COUNT_KEY_PREFIX = "short_link:click:";
     private static final String LAST_ACCESS_KEY_PREFIX = "short_link:last_access:";
 
-    // 1. 生成短链接
+    // 阶段 12 缓存雪崩防护：基础 TTL + 随机抖动，避免大量 key 同时过期压垮 MySQL
+    private static final long CACHE_BASE_TTL_DAYS = 7;
+    private static final long CACHE_TTL_JITTER_MINUTES = 10;
+
+    // ==================== 阶段 10：缓存一致性（Cache Aside Pattern） ====================
+    // 10.1 创建：MySQL 成功 → 再写 Redis
+    //   顺序：先落库（insert + 回写 shortCode），再预热缓存。
+    //   遵循「Cache Aside 写路径」：数据库是唯一真相源，缓存只是派生数据。
+    //   注：当前 Redis 写入仍在 @Transactional 内，Redis 故障会回滚 DB（见 deleteShortLink 注释里的优化点）。
     @Transactional
     public ShortLinkVO createShortLink(ShortLinkCreateDTO dto) {
         // 先插入一条只有 originUrl 的数据，获取自增 ID
@@ -59,10 +68,9 @@ public class ShortLinkService {
         shortLink.setShortCode(shortCode);
         shortLinkMapper.updateById(shortLink);
 
-        // 生成时顺便预热写入 Redis 缓存（缓存 7 天）
+        // 生成时顺便预热写入 Redis 缓存（基础 7 天 + 随机抖动，防雪崩）
         String redisKey = SHORT_LINK_KEY_PREFIX + shortCode;//短链接缓存键
-        // 缓存 7 天, 值为 originUrl
-        stringRedisTemplate.opsForValue().set(redisKey, dto.getOriginUrl(), 7, TimeUnit.DAYS);
+        stringRedisTemplate.opsForValue().set(redisKey, dto.getOriginUrl(), cacheTtlSeconds(), TimeUnit.SECONDS);
 
         //return shortCode;
         String domain = "http://localhost:8081/";
@@ -197,13 +205,13 @@ public class ShortLinkService {
             System.out.println("shortCode: " + shortCode);
             System.out.println("originUrl: " + originUrl);
 
-            // 写入短链接缓存
+            // 写入短链接缓存（基础 7 天 + 随机抖动，防雪崩）
             stringRedisTemplate.opsForValue()
                     .set(
                             redisKey,
                             originUrl,
-                            7,
-                            TimeUnit.DAYS
+                            cacheTtlSeconds(),
+                            TimeUnit.SECONDS
                     );
 
             // 记录访问
@@ -522,11 +530,21 @@ public class ShortLinkService {
     }
 
     /**
-     * 阶段 9：删除 / 失效短链接
-     * 第一版做「物理清理」：MySQL 记录 + 所有相关 Redis 键一起删，
-     * 避免「MySQL 删了但 Redis 还在、用户仍能访问」的脏数据问题。
-     * 删除后下一次访问会：Redis 未命中 → MySQL 未命中 → 写入 NULL_VALUE → 返回 404，
-     * 因此链接被正确失效。
+     * 阶段 9：删除 / 失效短链接（阶段 10 的 10.2 缓存一致性规则）
+     * 10.2 删除：MySQL 删除 → 再删 Redis
+     *   第一版做「物理清理」：MySQL 记录 + 所有相关 Redis 键一起删，
+     *   避免「MySQL 删了但 Redis 还在、用户仍能访问」的脏数据问题。
+     *   删除后下一次访问会：Redis 未命中 → MySQL 未命中 → 写入 NULL_VALUE → 返回 404，
+     *   因此链接被正确失效。
+     *
+     * 阶段 10 待落地规则（10.3 修改，当前无 update 接口）：
+     *   未来增加修改接口时，务必遵循「MySQL 更新 → 删 Redis（而非更新缓存）→ 下次访问重载」。
+     *   原因：并发下「先更新 DB 再更新缓存」可能留下旧缓存值；「更新 DB 后删缓存」
+     *   更稳妥——下次读未命中会自动从 DB 重新 load，天然一致。
+     *
+     * 优化点（一致性 ↔ 可用性）：本方法 Redis 删除在 @Transactional 内。
+     *   若 Redis 故障抛异常，会连累 MySQL 删除回滚。理想做法：先提交 DB 事务，
+     *   再删缓存；缓存删除失败仅记录告警/补偿，不回滚 DB。
      */
     @Transactional
     public void deleteShortLink(String shortCode) {
@@ -574,6 +592,17 @@ public class ShortLinkService {
                 .createTime(createTime)
                 .clickCount(clickCount)
                 .build();
+    }
+
+    /**
+     * 阶段 12：缓存雪崩防护
+     * 基础 TTL（7 天）+ 随机抖动（0~10 分钟），将热点 key 的过期时间打散，
+     * 避免「同一时刻大量 key 同时失效 → 瞬间大量回源 MySQL」的雪崩。
+     */
+    private long cacheTtlSeconds() {
+        long jitterSeconds = ThreadLocalRandom.current()
+                .nextLong(0, CACHE_TTL_JITTER_MINUTES + 1) * 60;
+        return TimeUnit.DAYS.toSeconds(CACHE_BASE_TTL_DAYS) + jitterSeconds;
     }
 
 }
