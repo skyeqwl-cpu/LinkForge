@@ -1,6 +1,8 @@
 package com.linkforge.exception;
 
 import com.linkforge.common.Result;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -22,9 +24,11 @@ public class GlobalExceptionHandler {
     }
 
     // 捕获系统未知异常
+    // 兜底分支必须返回真正的 HTTP 500，否则调用方（如 Apifox）会误判为「通过」
     @ExceptionHandler(Exception.class)
-    public Result<Void> handleException(Exception e) {
+    public ResponseEntity<Result<Void>> handleException(Exception e) {
         e.printStackTrace();
-        return Result.fail(500, "服务器内部错误");
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(Result.fail(500, "服务器内部错误"));
     }
 }

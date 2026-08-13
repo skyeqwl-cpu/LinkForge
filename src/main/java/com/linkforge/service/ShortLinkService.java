@@ -522,6 +522,34 @@ public class ShortLinkService {
     }
 
     /**
+     * 阶段 9：删除 / 失效短链接
+     * 第一版做「物理清理」：MySQL 记录 + 所有相关 Redis 键一起删，
+     * 避免「MySQL 删了但 Redis 还在、用户仍能访问」的脏数据问题。
+     * 删除后下一次访问会：Redis 未命中 → MySQL 未命中 → 写入 NULL_VALUE → 返回 404，
+     * 因此链接被正确失效。
+     */
+    @Transactional
+    public void deleteShortLink(String shortCode) {
+        // 1. 查询是否存在
+        ShortLink shortLink = shortLinkMapper.selectOne(
+                new LambdaQueryWrapper<ShortLink>()
+                        .eq(ShortLink::getShortCode, shortCode)
+        );
+        if (shortLink == null) {
+            throw new BizException(404, "短链接不存在或已失效");
+        }
+
+        // 2. 删除 MySQL 记录
+        shortLinkMapper.deleteById(shortLink.getId());
+
+        // 3. 删除 Redis 相关键
+        //    short_link:2 / short_link:click:2 / short_link:last_access:2
+        stringRedisTemplate.delete(SHORT_LINK_KEY_PREFIX + shortCode);
+        stringRedisTemplate.delete(CLICK_COUNT_KEY_PREFIX + shortCode);
+        stringRedisTemplate.delete(LAST_ACCESS_KEY_PREFIX + shortCode);
+    }
+
+    /**
      * 解析点击数：优先 Redis 实时计数，缺失时回退 MySQL 持久化值
      */
     private Long resolveClickCount(String shortCode, Long fallback) {

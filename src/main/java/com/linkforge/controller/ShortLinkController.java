@@ -124,6 +124,16 @@ public class ShortLinkController {
         return Result.success(shortLinkService.listShortLinks());
     }
 
+    // 阶段 9：删除 / 失效短链接（物理清理 MySQL + 相关 Redis 键）
+    @DeleteMapping("/api/v1/short-link/{shortCode}")
+    public Result<String> deleteShortLink(
+            @PathVariable String shortCode) {
+
+        shortLinkService.deleteShortLink(shortCode);
+
+        return Result.success("删除成功");
+    }
+
     @GetMapping("/sync/{shortCode}")
     public Result<String> syncClickCount(
             @PathVariable String shortCode) {
