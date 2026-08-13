@@ -4,6 +4,7 @@ import com.linkforge.common.Result;
 import com.linkforge.dto.ShortLinkCreateDTO;
 import com.linkforge.service.ShortLinkService;
 import com.linkforge.utils.Base62Utils;
+import com.linkforge.vo.ShortLinkStatsVO;
 import com.linkforge.vo.ShortLinkVO;
 import jakarta.servlet.http.HttpServletResponse;
 import jakarta.validation.Valid;
@@ -72,19 +73,13 @@ public class ShortLinkController {
         }
     }
     @GetMapping("/api/v1/short-link/{shortCode}/stats")
-    public Result<String> getStats(@PathVariable String shortCode) {
+    public Result<ShortLinkStatsVO> getStats(
+            @PathVariable String shortCode) {
 
-        String clickCountKey = "short_link:click:" + shortCode;
+        ShortLinkStatsVO stats =
+                shortLinkService.getStats(shortCode);
 
-        String clickCount = stringRedisTemplate
-                .opsForValue()
-                .get(clickCountKey);
-
-        if (clickCount == null) {
-            clickCount = "0";
-        }
-
-        return Result.success(clickCount);
+        return Result.success(stats);
     }
 
     @GetMapping("/sync/{shortCode}")

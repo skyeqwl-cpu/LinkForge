@@ -6,6 +6,7 @@ import com.linkforge.entity.ShortLink;
 import com.linkforge.exception.BizException;
 import com.linkforge.mapper.ShortLinkMapper;
 import com.linkforge.utils.Base62Utils;
+import com.linkforge.vo.ShortLinkStatsVO;
 import com.linkforge.vo.ShortLinkVO;
 import jakarta.annotation.PostConstruct;
 import org.redisson.api.RLock;
@@ -298,5 +299,81 @@ public class ShortLinkService {
     public void test() {
         System.out.println(redissonClient);
     }*/
+    /**
+     * 查询短链接访问统计
+     */
+    public ShortLinkStatsVO getStats(String shortCode) {
+
+        // 1. 查询 MySQL 中的短链接
+        LambdaQueryWrapper<ShortLink> wrapper =
+                new LambdaQueryWrapper<>();
+
+        wrapper.eq(ShortLink::getShortCode, shortCode);
+
+        ShortLink shortLink =
+                shortLinkMapper.selectOne(wrapper);
+
+        // 2. 短链接不存在
+        if (shortLink == null) {
+            throw new BizException(
+                    404,
+                    "短链接不存在或已失效"
+            );
+        }
+
+        // 3. 查询 Redis 点击次数
+        String clickKey =
+                CLICK_COUNT_KEY_PREFIX + shortCode;
+
+        String clickValue =
+                stringRedisTemplate
+                        .opsForValue()
+                        .get(clickKey);
+
+        Long clickCount;
+
+        if (clickValue == null) {
+            // Redis 没有统计数据时，使用 MySQL 数据
+            clickCount = shortLink.getClickCount();
+
+            if (clickCount == null) {
+                clickCount = 0L;
+            }
+        } else {
+            clickCount = Long.parseLong(clickValue);
+        }
+
+        // 4. 查询 Redis 最后访问时间
+        String lastAccessKey =
+                LAST_ACCESS_KEY_PREFIX + shortCode;
+
+        String lastAccessValue =
+                stringRedisTemplate
+                        .opsForValue()
+                        .get(lastAccessKey);
+
+        String lastAccessTime = null;
+
+        if (lastAccessValue != null) {
+
+            long timestamp =
+                    Long.parseLong(lastAccessValue);
+
+            lastAccessTime =
+                    new java.text.SimpleDateFormat(
+                            "yyyy-MM-dd HH:mm:ss"
+                    ).format(
+                            new java.util.Date(timestamp)
+                    );
+        }
+
+        // 5. 返回统计信息
+        return ShortLinkStatsVO.builder()
+                .shortCode(shortCode)
+                .originUrl(shortLink.getOriginUrl())
+                .clickCount(clickCount)
+                .lastAccessTime(lastAccessTime)
+                .build();
+    }
 
 }
