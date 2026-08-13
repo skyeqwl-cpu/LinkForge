@@ -18,4 +18,6 @@ public class ShortLink {
     private String originUrl;
 
     private LocalDateTime createTime;
+
+    private Long clickCount;
 }

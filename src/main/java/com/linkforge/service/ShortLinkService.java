@@ -32,6 +32,10 @@ public class ShortLinkService {
     private static final String SHORT_LINK_KEY_PREFIX = "short_link:";//短链接缓存前缀
     private static final String NULL_VALUE = "__NULL__";
 
+    // 访问统计
+    private static final String CLICK_COUNT_KEY_PREFIX = "short_link:click:";
+    private static final String LAST_ACCESS_KEY_PREFIX = "short_link:last_access:";
+
     // 1. 生成短链接
     @Transactional
     public ShortLinkVO createShortLink(ShortLinkCreateDTO dto) {
@@ -83,10 +87,15 @@ public class ShortLinkService {
                 throw new BizException(404, "短链接不存在或已失效");
             }
 
-            // 正常命中
+            // ==============================
+            // Redis 命中
+            // ==============================
             System.out.println("====== Redis 命中 ======");
             System.out.println("shortCode: " + shortCode);
             System.out.println("originUrl: " + originUrl);
+
+            // 记录访问
+            recordAccess(shortCode);
 
             return originUrl;
         }
@@ -134,6 +143,9 @@ public class ShortLinkService {
 
                 System.out.println("originUrl: " + originUrl);
 
+                // 记录访问
+                recordAccess(shortCode);
+
                 return originUrl;
             }
 
@@ -177,6 +189,7 @@ public class ShortLinkService {
             System.out.println("shortCode: " + shortCode);
             System.out.println("originUrl: " + originUrl);
 
+            // 写入短链接缓存
             stringRedisTemplate.opsForValue()
                     .set(
                             redisKey,
@@ -184,6 +197,9 @@ public class ShortLinkService {
                             7,
                             TimeUnit.DAYS
                     );
+
+            // 记录访问
+            recordAccess(shortCode);
 
             return originUrl;
 
@@ -203,6 +219,79 @@ public class ShortLinkService {
                 lock.unlock();
             }
         }
+    }
+
+    /**
+     * 记录短链接访问
+     */
+    public void recordAccess(String shortCode) {
+
+        // 1. 访问次数 +1
+        String clickCountKey = CLICK_COUNT_KEY_PREFIX + shortCode;
+
+        Long count = stringRedisTemplate
+                .opsForValue()
+                .increment(clickCountKey);
+
+        // 2. 记录最后访问时间
+        String lastAccessKey = LAST_ACCESS_KEY_PREFIX + shortCode;
+
+        stringRedisTemplate.opsForValue().set(
+                lastAccessKey,
+                String.valueOf(System.currentTimeMillis())
+        );
+
+        System.out.println("====== 记录访问 ======");
+        System.out.println("shortCode: " + shortCode);
+        System.out.println("clickCount: " + count);
+    }
+    /**
+     * 将 Redis 点击次数同步到 MySQL
+     */
+    public void syncClickCountToMySQL(String shortCode) {
+
+        String clickKey = CLICK_COUNT_KEY_PREFIX + shortCode;
+
+        // 1. 获取 Redis 点击次数
+        String clickValue = stringRedisTemplate
+                .opsForValue()
+                .get(clickKey);
+
+        if (clickValue == null) {
+            System.out.println("====== Redis 没有点击数据 ======");
+            System.out.println("shortCode: " + shortCode);
+            return;
+        }
+
+        long clickCount = Long.parseLong(clickValue);
+
+        System.out.println("====== Redis 点击次数 ======");
+        System.out.println("shortCode: " + shortCode);
+        System.out.println("clickCount: " + clickCount);
+
+        // 2. 查询 MySQL
+        LambdaQueryWrapper<ShortLink> wrapper =
+                new LambdaQueryWrapper<>();
+
+        wrapper.eq(ShortLink::getShortCode, shortCode);
+
+        ShortLink shortLink =
+                shortLinkMapper.selectOne(wrapper);
+
+        if (shortLink == null) {
+            System.out.println("====== MySQL 短链接不存在 ======");
+            System.out.println("shortCode: " + shortCode);
+            return;
+        }
+
+        // 3. 更新 MySQL 点击次数
+        shortLink.setClickCount(clickCount);
+
+        shortLinkMapper.updateById(shortLink);
+
+        System.out.println("====== MySQL 点击次数同步成功 ======");
+        System.out.println("shortCode: " + shortCode);
+        System.out.println("clickCount: " + clickCount);
     }
 
    /* @PostConstruct

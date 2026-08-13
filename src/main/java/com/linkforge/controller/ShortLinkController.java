@@ -8,6 +8,7 @@ import com.linkforge.vo.ShortLinkVO;
 import jakarta.servlet.http.HttpServletResponse;
 import jakarta.validation.Valid;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.web.bind.annotation.*;
 
 import java.io.IOException;
@@ -24,6 +25,8 @@ public class ShortLinkController {
 
     @Autowired
     private ShortLinkService shortLinkService;
+    @Autowired
+    private StringRedisTemplate stringRedisTemplate;
 
    /* //生成短链接接口（模拟）
     @PostMapping ("/api/v1/short-link")
@@ -67,5 +70,29 @@ public class ShortLinkController {
         } else {
             response.sendError(HttpServletResponse.SC_NOT_FOUND, "短链接不存在或已失效");
         }
+    }
+    @GetMapping("/api/v1/short-link/{shortCode}/stats")
+    public Result<String> getStats(@PathVariable String shortCode) {
+
+        String clickCountKey = "short_link:click:" + shortCode;
+
+        String clickCount = stringRedisTemplate
+                .opsForValue()
+                .get(clickCountKey);
+
+        if (clickCount == null) {
+            clickCount = "0";
+        }
+
+        return Result.success(clickCount);
+    }
+
+    @GetMapping("/sync/{shortCode}")
+    public Result<String> syncClickCount(
+            @PathVariable String shortCode) {
+
+        shortLinkService.syncClickCountToMySQL(shortCode);
+
+        return Result.success("同步成功");
     }
 }
