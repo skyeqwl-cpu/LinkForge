@@ -1,11 +1,15 @@
 package com.linkforge.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.linkforge.common.PageResult;
 import com.linkforge.dto.ShortLinkCreateDTO;
 import com.linkforge.entity.ShortLink;
 import com.linkforge.exception.BizException;
 import com.linkforge.mapper.ShortLinkMapper;
 import com.linkforge.utils.Base62Utils;
+import com.linkforge.vo.ShortLinkDetailVO;
+import com.linkforge.vo.ShortLinkManageVO;
 import com.linkforge.vo.ShortLinkStatsVO;
 import com.linkforge.vo.ShortLinkVO;
 import jakarta.annotation.PostConstruct;
@@ -17,7 +21,10 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 
+import java.time.format.DateTimeFormatter;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 @Service
 public class ShortLinkService {
@@ -373,6 +380,171 @@ public class ShortLinkService {
                 .originUrl(shortLink.getOriginUrl())
                 .clickCount(clickCount)
                 .lastAccessTime(lastAccessTime)
+                .build();
+    }
+    /**
+     * 查询短链接详细统计信息
+     */
+    public ShortLinkDetailVO getShortLinkDetail(String shortCode) {
+
+        // 1. 查询 MySQL
+        LambdaQueryWrapper<ShortLink> wrapper =
+                new LambdaQueryWrapper<>();
+
+        wrapper.eq(ShortLink::getShortCode, shortCode);
+
+        ShortLink shortLink =
+                shortLinkMapper.selectOne(wrapper);
+
+        // 2. 短链接不存在
+        if (shortLink == null) {
+            throw new BizException(
+                    404,
+                    "短链接不存在或已失效"
+            );
+        }
+
+        // 3. 获取 Redis 点击次数
+        String clickKey =
+                CLICK_COUNT_KEY_PREFIX + shortCode;
+
+        String clickValue =
+                stringRedisTemplate
+                        .opsForValue()
+                        .get(clickKey);
+
+        Long clickCount;
+
+        if (clickValue == null) {
+            // Redis 没有统计数据，就使用 MySQL 数据
+            clickCount = shortLink.getClickCount();
+
+            if (clickCount == null) {
+                clickCount = 0L;
+            }
+
+        } else {
+            clickCount = Long.parseLong(clickValue);
+        }
+
+        // 4. 获取最后访问时间
+        String lastAccessKey =
+                LAST_ACCESS_KEY_PREFIX + shortCode;
+
+        String lastAccessValue =
+                stringRedisTemplate
+                        .opsForValue()
+                        .get(lastAccessKey);
+
+        String lastAccessTime = null;
+
+        if (lastAccessValue != null) {
+
+            long timestamp =
+                    Long.parseLong(lastAccessValue);
+
+            lastAccessTime =
+                    java.time.Instant
+                            .ofEpochMilli(timestamp)
+                            .atZone(
+                                    java.time.ZoneId.systemDefault()
+                            )
+                            .toLocalDateTime()
+                            .toString();
+        }
+
+        // 5. 组装 VO
+        return ShortLinkDetailVO.builder()
+                .shortCode(shortCode)
+                .originUrl(shortLink.getOriginUrl())
+                .createTime(shortLink.getCreateTime())
+                .clickCount(clickCount)
+                .lastAccessTime(lastAccessTime)
+                .build();
+    }
+
+    // ==================== 阶段 8：短链接管理接口 ====================
+
+    private static final DateTimeFormatter MANAGE_TIME_FORMATTER =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+    /**
+     * 8.1 查询单个短链接
+     */
+    public ShortLinkManageVO getShortLinkByCode(String shortCode) {
+        ShortLink shortLink = shortLinkMapper.selectOne(
+                new LambdaQueryWrapper<ShortLink>()
+                        .eq(ShortLink::getShortCode, shortCode)
+        );
+        if (shortLink == null) {
+            throw new BizException(404, "短链接不存在或已失效");
+        }
+        // 点击数优先取 Redis 实时值，否则回退 MySQL 持久化值
+        Long clickCount = resolveClickCount(shortCode, shortLink.getClickCount());
+        return toManageVO(shortLink, clickCount);
+    }
+
+    /**
+     * 8.2 查询短链接列表（不分页，全部返回，按创建时间倒序）
+     */
+    public List<ShortLinkManageVO> listShortLinks() {
+        List<ShortLink> list = shortLinkMapper.selectList(
+                new LambdaQueryWrapper<ShortLink>()
+                        .orderByDesc(ShortLink::getCreateTime)
+        );
+        return list.stream()
+                .map(e -> toManageVO(e, e.getClickCount()))
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * 8.3 分页查询短链接
+     * 使用 MyBatis-Plus 的 Page<ShortLink>
+     */
+    public PageResult<ShortLinkManageVO> listShortLinksByPage(long page, long size) {
+        Page<ShortLink> pageReq = new Page<>(page, size);
+        Page<ShortLink> pageResult = shortLinkMapper.selectPage(
+                pageReq,
+                new LambdaQueryWrapper<ShortLink>()
+                        .orderByDesc(ShortLink::getCreateTime)
+        );
+
+        List<ShortLinkManageVO> records = pageResult.getRecords().stream()
+                .map(e -> toManageVO(e, e.getClickCount()))
+                .collect(Collectors.toList());
+
+        PageResult<ShortLinkManageVO> result = new PageResult<>();
+        result.setRecords(records);
+        result.setTotal(pageResult.getTotal());
+        result.setPage(page);
+        result.setSize(size);
+        return result;
+    }
+
+    /**
+     * 解析点击数：优先 Redis 实时计数，缺失时回退 MySQL 持久化值
+     */
+    private Long resolveClickCount(String shortCode, Long fallback) {
+        String clickValue = stringRedisTemplate
+                .opsForValue()
+                .get(CLICK_COUNT_KEY_PREFIX + shortCode);
+        if (clickValue != null) {
+            return Long.parseLong(clickValue);
+        }
+        return fallback == null ? 0L : fallback;
+    }
+
+    /**
+     * 实体 → 管理视图对象（createTime 序列化为字符串）
+     */
+    private ShortLinkManageVO toManageVO(ShortLink e, Long clickCount) {
+        String createTime = e.getCreateTime() == null ? null
+                : e.getCreateTime().format(MANAGE_TIME_FORMATTER);
+        return ShortLinkManageVO.builder()
+                .shortCode(e.getShortCode())
+                .originUrl(e.getOriginUrl())
+                .createTime(createTime)
+                .clickCount(clickCount)
                 .build();
     }
 

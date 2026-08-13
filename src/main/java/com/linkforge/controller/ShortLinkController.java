@@ -1,9 +1,12 @@
 package com.linkforge.controller;
 
+import com.linkforge.common.PageResult;
 import com.linkforge.common.Result;
 import com.linkforge.dto.ShortLinkCreateDTO;
 import com.linkforge.service.ShortLinkService;
 import com.linkforge.utils.Base62Utils;
+import com.linkforge.vo.ShortLinkDetailVO;
+import com.linkforge.vo.ShortLinkManageVO;
 import com.linkforge.vo.ShortLinkStatsVO;
 import com.linkforge.vo.ShortLinkVO;
 import jakarta.servlet.http.HttpServletResponse;
@@ -80,6 +83,45 @@ public class ShortLinkController {
                 shortLinkService.getStats(shortCode);
 
         return Result.success(stats);
+    }
+    @GetMapping("/api/v1/short-link/{shortCode}/stats1")
+    public Result<ShortLinkDetailVO> getStats1(
+            @PathVariable String shortCode) {
+
+        ShortLinkDetailVO vo =
+                shortLinkService.getShortLinkDetail(shortCode);
+
+        return Result.success(vo);
+    }
+
+    // 8.1 查询单个短链接
+    @GetMapping("/api/v1/short-link/{shortCode}")
+    public Result<ShortLinkManageVO> getShortLink(
+            @PathVariable String shortCode) {
+
+        ShortLinkManageVO vo =
+                shortLinkService.getShortLinkByCode(shortCode);
+
+        return Result.success(vo);
+    }
+
+    // 8.2 查询短链接列表（最简单列表）
+    // 8.3 分页查询：追加 ?page=1&size=10 即返回分页结构
+    // 同一个 list 接口，不传 size 走「全部列表」，传 size>0 走「分页」
+    @GetMapping("/api/v1/short-link/list")
+    public Result<?> listShortLinks(
+            @RequestParam(required = false, defaultValue = "1") long page,
+            @RequestParam(required = false, defaultValue = "0") long size) {
+
+        // size > 0：分页查询
+        if (size > 0) {
+            PageResult<ShortLinkManageVO> pageResult =
+                    shortLinkService.listShortLinksByPage(page, size);
+            return Result.success(pageResult);
+        }
+
+        // 否则：返回全部列表（最简单的列表）
+        return Result.success(shortLinkService.listShortLinks());
     }
 
     @GetMapping("/sync/{shortCode}")
