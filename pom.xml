@@ -117,6 +117,12 @@
             <scope>test</scope>
         </dependency>
 
+        <!-- Caffeine 本地缓存 -->
+        <dependency>
+            <groupId>com.github.ben-manes.caffeine</groupId>
+            <artifactId>caffeine</artifactId>
+        </dependency>
+
     </dependencies>
 
     <!-- Spring Boot Maven 插件 -->

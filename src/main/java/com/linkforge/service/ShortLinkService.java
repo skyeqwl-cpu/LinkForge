@@ -2,6 +2,7 @@ package com.linkforge.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.github.benmanes.caffeine.cache.Cache;
 import com.linkforge.common.LoginUserContext;
 import com.linkforge.common.PageResult;
 import com.linkforge.dto.ShortLinkCreateDTO;
@@ -44,6 +45,9 @@ public class ShortLinkService {
 
     @Autowired
     private RBloomFilter<String> shortLinkBloomFilter;
+
+    @Autowired
+    private Cache<String, String> shortLinkLocalCache;
 
     private static final String SHORT_LINK_KEY_PREFIX = "short_link:";//短链接缓存前缀
     private static final String NULL_VALUE = "__NULL__";
@@ -126,11 +130,24 @@ public class ShortLinkService {
             throw new BizException(404, "短链接不存在或已失效");
         }
 
+        // 【防线】：查 L1 Caffeine 本地缓存（0 网络 I/O，极速返回）
+        String originUrl = shortLinkLocalCache.getIfPresent(shortCode);
+        if (originUrl != null) {
+            if (NULL_VALUE.equals(originUrl)) {
+                System.out.println("====== L1 Caffeine 命中：空值 ======");
+                throw new BizException(404, "短链接不存在或已失效");
+            }
+            System.out.println("====== L1 Caffeine 本地缓存命中 ======");
+            System.out.println("shortCode: " + shortCode + " -> " + originUrl);
+            recordAccess(shortCode); // 异步/原子记录访问
+            return originUrl;
+        }
+
         // 1. Redis Key
         String redisKey = SHORT_LINK_KEY_PREFIX + shortCode;
 
         // 2. 查询 Redis
-        String originUrl = stringRedisTemplate
+         originUrl = stringRedisTemplate
                 .opsForValue()
                 .get(redisKey);
 
@@ -153,13 +170,14 @@ public class ShortLinkService {
                 throw new BizException(404, "短链接已过期失效");
             }
 
-            // ==============================
-            // Redis 命中
-            // ==============================
-            System.out.println("====== Redis 命中 ======");
+            // ====================================================
+            // 【关键修复】：Redis 命中后，同步回写到 L1 Caffeine 本地缓存
+            // ====================================================
+            shortLinkLocalCache.put(shortCode, originUrl);
+
+            System.out.println("====== Redis 命中，已同步回填 L1 Caffeine ======");
             System.out.println("shortCode: " + shortCode);
             System.out.println("originUrl: " + originUrl);
-
             // 记录访问
             recordAccess(shortCode);
 
@@ -644,6 +662,9 @@ public class ShortLinkService {
 
         // 2. 删除 MySQL 记录
         shortLinkMapper.deleteById(shortLink.getId());
+
+        // 清理 L1 本地缓存
+        shortLinkLocalCache.invalidate(shortCode);
 
         // 3. 删除 Redis 相关键
         //    short_link:2 / short_link:click:2 / short_link:last_access:2 / short_link:expire:2
