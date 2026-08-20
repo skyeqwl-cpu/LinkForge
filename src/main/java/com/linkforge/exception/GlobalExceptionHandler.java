@@ -16,6 +16,13 @@ public class GlobalExceptionHandler {
         return Result.fail(e.getCode(), e.getMessage());
     }
 
+    // 捕获认证异常（未登录 / token 失效 / 已登出）→ 真正 HTTP 401
+    @ExceptionHandler(AuthException.class)
+    public ResponseEntity<Result<Void>> handleAuthException(AuthException e) {
+        return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                .body(Result.fail(e.getCode(), e.getMessage()));
+    }
+
     // 捕获 @Valid 参数校验失败异常
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public Result<Void> handleValidationException(MethodArgumentNotValidException e) {

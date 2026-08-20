@@ -9,4 +9,5 @@ public class ShortLinkVO {
     private String shortCode;
     private String shortUrl;
     private String originUrl;
+    private String expireTime;
 }

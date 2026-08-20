@@ -2,6 +2,7 @@ package com.linkforge.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.linkforge.common.LoginUserContext;
 import com.linkforge.common.PageResult;
 import com.linkforge.dto.ShortLinkCreateDTO;
 import com.linkforge.entity.ShortLink;
@@ -21,6 +22,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 
+import java.time.Instant;
+import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
@@ -49,6 +52,13 @@ public class ShortLinkService {
     private static final long CACHE_BASE_TTL_DAYS = 7;
     private static final long CACHE_TTL_JITTER_MINUTES = 10;
 
+    // 阶段 13：短链接生命周期
+    private static final int DEFAULT_VALID_DAYS = 7;            // 默认有效期（天）
+    private static final String EXPIRE_KEY_PREFIX = "short_link:expire:"; // 过期时间戳缓存键
+
+    // 短链接域名（用于拼装 shortUrl，统一管理避免硬编码散落）
+    private static final String SHORT_LINK_DOMAIN = "http://localhost:8081/";
+
     // ==================== 阶段 10：缓存一致性（Cache Aside Pattern） ====================
     // 10.1 创建：MySQL 成功 → 再写 Redis
     //   顺序：先落库（insert + 回写 shortCode），再预热缓存。
@@ -59,6 +69,14 @@ public class ShortLinkService {
         // 先插入一条只有 originUrl 的数据，获取自增 ID
         ShortLink shortLink = new ShortLink();
         shortLink.setOriginUrl(dto.getOriginUrl());
+        // 多用户：归属当前登录用户（JWT 拦截器已写入上下文）
+        shortLink.setUserId(LoginUserContext.getUserId());
+
+        // 6.4 计算过期时间：默认 7 天，用户可传 validDays 覆盖
+        int validDays = dto.getValidDays() != null ? dto.getValidDays() : DEFAULT_VALID_DAYS;
+        LocalDateTime expireTime = LocalDateTime.now().plusDays(validDays);
+        shortLink.setExpireTime(expireTime);
+
         shortLinkMapper.insert(shortLink);
 
         // 根据自增 ID 转成 Base62 短码
@@ -68,16 +86,26 @@ public class ShortLinkService {
         shortLink.setShortCode(shortCode);
         shortLinkMapper.updateById(shortLink);
 
-        // 生成时顺便预热写入 Redis 缓存（基础 7 天 + 随机抖动，防雪崩）
+        // 6.5 预热写入 Redis 缓存：TTL = 距过期剩余秒数 + 随机抖动（防雪崩）
         String redisKey = SHORT_LINK_KEY_PREFIX + shortCode;//短链接缓存键
-        stringRedisTemplate.opsForValue().set(redisKey, dto.getOriginUrl(), cacheTtlSeconds(), TimeUnit.SECONDS);
+        long ttl = cacheTtlSeconds(expireTime);
+        stringRedisTemplate.opsForValue().set(redisKey, dto.getOriginUrl(), ttl, TimeUnit.SECONDS);
+
+        // 6.6 业务层二次过期校验用的过期时间戳：与短链缓存同 TTL 自动淘汰
+        stringRedisTemplate.opsForValue().set(
+                EXPIRE_KEY_PREFIX + shortCode,
+                String.valueOf(toEpochSeconds(expireTime)),
+                ttl,
+                TimeUnit.SECONDS
+        );
 
         //return shortCode;
-        String domain = "http://localhost:8081/";
+        String domain = SHORT_LINK_DOMAIN;
         return ShortLinkVO.builder()
                 .shortCode(shortCode)
                 .shortUrl(domain + shortCode)
                 .originUrl(dto.getOriginUrl())
+                .expireTime(expireTime.format(MANAGE_TIME_FORMATTER))
                 .build();
     }
 
@@ -101,6 +129,14 @@ public class ShortLinkService {
                 System.out.println("shortCode: " + shortCode);
 
                 throw new BizException(404, "短链接不存在或已失效");
+            }
+
+            // 6.6 业务层二次过期校验：即使 Redis Key 仍存活，也可能因 TTL 抖动略超期
+            if (isExpiredAndClean(shortCode, redisKey)) {
+                System.out.println("====== Redis 命中但已过期 ======");
+                System.out.println("shortCode: " + shortCode);
+
+                throw new BizException(404, "短链接已过期失效");
             }
 
             // ==============================
@@ -157,6 +193,11 @@ public class ShortLinkService {
                     throw new BizException(404, "短链接不存在或已失效");
                 }
 
+                // 6.6 业务层二次过期校验
+                if (isExpiredAndClean(shortCode, redisKey)) {
+                    throw new BizException(404, "短链接已过期失效");
+                }
+
                 System.out.println("originUrl: " + originUrl);
 
                 // 记录访问
@@ -198,6 +239,18 @@ public class ShortLinkService {
                 );
             }
 
+            // 6.6 过期校验：数据库里已过期 → 视为失效，写短 TTL 空值避免反复打 DB
+            if (shortLink.getExpireTime() != null
+                    && toEpochSeconds(shortLink.getExpireTime()) <= Instant.now().getEpochSecond()) {
+                System.out.println("====== MySQL 命中但已过期 ======");
+                System.out.println("shortCode: " + shortCode);
+
+                stringRedisTemplate.opsForValue()
+                        .set(redisKey, NULL_VALUE, 5, TimeUnit.MINUTES);
+
+                throw new BizException(404, "短链接已过期失效");
+            }
+
             // 10. MySQL 查询成功
             originUrl = shortLink.getOriginUrl();
 
@@ -205,14 +258,25 @@ public class ShortLinkService {
             System.out.println("shortCode: " + shortCode);
             System.out.println("originUrl: " + originUrl);
 
-            // 写入短链接缓存（基础 7 天 + 随机抖动，防雪崩）
+            // 写入短链缓存（TTL = 距过期剩余秒数 + 随机抖动，防雪崩）
+            long ttl = cacheTtlSeconds(shortLink.getExpireTime());
             stringRedisTemplate.opsForValue()
                     .set(
                             redisKey,
                             originUrl,
-                            cacheTtlSeconds(),
+                            ttl,
                             TimeUnit.SECONDS
                     );
+
+            // 写入过期时间戳（与短链缓存同 TTL），供业务层二次过期校验
+            if (shortLink.getExpireTime() != null) {
+                stringRedisTemplate.opsForValue().set(
+                        EXPIRE_KEY_PREFIX + shortCode,
+                        String.valueOf(toEpochSeconds(shortLink.getExpireTime())),
+                        ttl,
+                        TimeUnit.SECONDS
+                );
+            }
 
             // 记录访问
             recordAccess(shortCode);
@@ -319,11 +383,12 @@ public class ShortLinkService {
      */
     public ShortLinkStatsVO getStats(String shortCode) {
 
-        // 1. 查询 MySQL 中的短链接
+        // 1. 查询 MySQL 中的短链接（且必须属于当前用户）
         LambdaQueryWrapper<ShortLink> wrapper =
                 new LambdaQueryWrapper<>();
 
-        wrapper.eq(ShortLink::getShortCode, shortCode);
+        wrapper.eq(ShortLink::getShortCode, shortCode)
+               .eq(ShortLink::getUserId, LoginUserContext.getUserId());
 
         ShortLink shortLink =
                 shortLinkMapper.selectOne(wrapper);
@@ -395,11 +460,12 @@ public class ShortLinkService {
      */
     public ShortLinkDetailVO getShortLinkDetail(String shortCode) {
 
-        // 1. 查询 MySQL
+        // 1. 查询 MySQL（且必须属于当前用户）
         LambdaQueryWrapper<ShortLink> wrapper =
                 new LambdaQueryWrapper<>();
 
-        wrapper.eq(ShortLink::getShortCode, shortCode);
+        wrapper.eq(ShortLink::getShortCode, shortCode)
+               .eq(ShortLink::getUserId, LoginUserContext.getUserId());
 
         ShortLink shortLink =
                 shortLinkMapper.selectOne(wrapper);
@@ -466,6 +532,7 @@ public class ShortLinkService {
                 .shortCode(shortCode)
                 .originUrl(shortLink.getOriginUrl())
                 .createTime(shortLink.getCreateTime())
+                .expireTime(shortLink.getExpireTime())
                 .clickCount(clickCount)
                 .lastAccessTime(lastAccessTime)
                 .build();
@@ -483,6 +550,7 @@ public class ShortLinkService {
         ShortLink shortLink = shortLinkMapper.selectOne(
                 new LambdaQueryWrapper<ShortLink>()
                         .eq(ShortLink::getShortCode, shortCode)
+                        .eq(ShortLink::getUserId, LoginUserContext.getUserId())
         );
         if (shortLink == null) {
             throw new BizException(404, "短链接不存在或已失效");
@@ -498,6 +566,7 @@ public class ShortLinkService {
     public List<ShortLinkManageVO> listShortLinks() {
         List<ShortLink> list = shortLinkMapper.selectList(
                 new LambdaQueryWrapper<ShortLink>()
+                        .eq(ShortLink::getUserId, LoginUserContext.getUserId())
                         .orderByDesc(ShortLink::getCreateTime)
         );
         return list.stream()
@@ -514,6 +583,7 @@ public class ShortLinkService {
         Page<ShortLink> pageResult = shortLinkMapper.selectPage(
                 pageReq,
                 new LambdaQueryWrapper<ShortLink>()
+                        .eq(ShortLink::getUserId, LoginUserContext.getUserId())
                         .orderByDesc(ShortLink::getCreateTime)
         );
 
@@ -548,10 +618,11 @@ public class ShortLinkService {
      */
     @Transactional
     public void deleteShortLink(String shortCode) {
-        // 1. 查询是否存在
+        // 1. 查询是否存在（且必须属于当前用户，避免删到别人的短链）
         ShortLink shortLink = shortLinkMapper.selectOne(
                 new LambdaQueryWrapper<ShortLink>()
                         .eq(ShortLink::getShortCode, shortCode)
+                        .eq(ShortLink::getUserId, LoginUserContext.getUserId())
         );
         if (shortLink == null) {
             throw new BizException(404, "短链接不存在或已失效");
@@ -561,10 +632,11 @@ public class ShortLinkService {
         shortLinkMapper.deleteById(shortLink.getId());
 
         // 3. 删除 Redis 相关键
-        //    short_link:2 / short_link:click:2 / short_link:last_access:2
+        //    short_link:2 / short_link:click:2 / short_link:last_access:2 / short_link:expire:2
         stringRedisTemplate.delete(SHORT_LINK_KEY_PREFIX + shortCode);
         stringRedisTemplate.delete(CLICK_COUNT_KEY_PREFIX + shortCode);
         stringRedisTemplate.delete(LAST_ACCESS_KEY_PREFIX + shortCode);
+        stringRedisTemplate.delete(EXPIRE_KEY_PREFIX + shortCode);
     }
 
     /**
@@ -586,23 +658,60 @@ public class ShortLinkService {
     private ShortLinkManageVO toManageVO(ShortLink e, Long clickCount) {
         String createTime = e.getCreateTime() == null ? null
                 : e.getCreateTime().format(MANAGE_TIME_FORMATTER);
+        String expireTime = e.getExpireTime() == null ? null
+                : e.getExpireTime().format(MANAGE_TIME_FORMATTER);
         return ShortLinkManageVO.builder()
                 .shortCode(e.getShortCode())
+                .shortUrl(SHORT_LINK_DOMAIN + e.getShortCode())
                 .originUrl(e.getOriginUrl())
                 .createTime(createTime)
+                .expireTime(expireTime)
                 .clickCount(clickCount)
                 .build();
     }
 
-    /**
-     * 阶段 12：缓存雪崩防护
-     * 基础 TTL（7 天）+ 随机抖动（0~10 分钟），将热点 key 的过期时间打散，
-     * 避免「同一时刻大量 key 同时失效 → 瞬间大量回源 MySQL」的雪崩。
-     */
-    private long cacheTtlSeconds() {
+    private long cacheTtlSeconds(LocalDateTime expireTime) {
         long jitterSeconds = ThreadLocalRandom.current()
                 .nextLong(0, CACHE_TTL_JITTER_MINUTES + 1) * 60;
-        return TimeUnit.DAYS.toSeconds(CACHE_BASE_TTL_DAYS) + jitterSeconds;
+        if (expireTime == null) {
+            // 无过期时间（长期有效）→ 回落到基础 7 天 TTL
+            return TimeUnit.DAYS.toSeconds(CACHE_BASE_TTL_DAYS) + jitterSeconds;
+        }
+        // 距过期剩余秒数（至少 60 秒，避免过期时间已过时 TTL 为负）
+        long remaining = java.time.Duration.between(LocalDateTime.now(), expireTime).getSeconds();
+        return Math.max(remaining, 60) + jitterSeconds;
+    }
+
+    /**
+     * 阶段 13：LocalDateTime → 绝对秒级时间戳（按系统默认时区）
+     * 用于把 expire_time 与「当前秒」做比较，判断短链是否过期。
+     */
+    private long toEpochSeconds(LocalDateTime time) {
+        return time.atZone(java.time.ZoneId.systemDefault()).toEpochSecond();
+    }
+
+    /**
+     * 6.6 业务层二次过期校验（旁路缓存一致性）。
+     * 读取 Redis 中缓存的过期时间戳（short_link:expire:{code}）：
+     * - 若该短链已过期，清理短链缓存与过期时间戳，返回 true（调用方按失效处理）；
+     * - 若无过期信息（历史缓存），返回 false，信任 Redis TTL。
+     * 这样即便 Redis Key 因 TTL 抖动仍存活，也不会返回已过期链接。
+     */
+    private boolean isExpiredAndClean(String shortCode, String redisKey) {
+        String expireVal = stringRedisTemplate
+                .opsForValue()
+                .get(EXPIRE_KEY_PREFIX + shortCode);
+        if (expireVal == null) {
+            return false;
+        }
+        long expireEpoch = Long.parseLong(expireVal);
+        long nowEpoch = Instant.now().getEpochSecond();
+        if (expireEpoch > 0 && expireEpoch <= nowEpoch) {
+            stringRedisTemplate.delete(redisKey);
+            stringRedisTemplate.delete(EXPIRE_KEY_PREFIX + shortCode);
+            return true;
+        }
+        return false;
     }
 
 }

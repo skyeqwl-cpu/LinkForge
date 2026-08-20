@@ -25,6 +25,11 @@ public class ShortLinkDetailVO {
     private LocalDateTime createTime;
 
     /**
+     * 过期时间，NULL 表示长期有效
+     */
+    private LocalDateTime expireTime;
+
+    /**
      * 点击次数
      */
     private Long clickCount;

@@ -15,8 +15,16 @@ public class ShortLink {
 
     private String originUrl;
 
+    // 多用户平台：所属用户 id（NULL 仅兼容迁移前的历史数据，新数据必定有值）
+    @TableField("user_id")
+    private Long userId;
+
     @TableField(fill = FieldFill.INSERT)
     private LocalDateTime createTime;
 
     private Long clickCount;
+
+    // 阶段 13：短链接生命周期，过期时间（NULL 表示长期有效）
+    @TableField("expire_time")
+    private LocalDateTime expireTime;
 }

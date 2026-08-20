@@ -19,6 +19,13 @@ spring:
   redisson:
     address: redis://127.0.0.1:6379
 
+# JWT 配置
+jwt:
+  # HS256 要求密钥 >= 32 字节（256 位），以下字符串远超此长度
+  secret: "LinkForge-JWT-Secret-Key-2026-Must-Be-At-Least-32-Bytes-Long-!!"
+  # 有效期：24 小时（单位：毫秒）
+  expiration: 86400000
+
 
 mybatis:
   mapper-locations: classpath:mapper/*.xml

@@ -22,10 +22,10 @@ public class ShortLinkSyncTask {
     private static final String CLICK_COUNT_KEY_PREFIX = "short_link:click:";
 
     /**
-     * 每 1 分钟执行一次
+     * 每 10 分钟执行一次
      * 将 Redis 中的点击次数同步到 MySQL
      */
-    @Scheduled(fixedRate = 60 * 1000)
+    @Scheduled(fixedRate = 600 * 1000)
     public void syncClickCount() {
 
         System.out.println("====================================");

@@ -1,5 +1,6 @@
 package com.linkforge.dto;
 
+import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import lombok.Data;
 import org.hibernate.validator.constraints.URL;
@@ -10,4 +11,12 @@ public class ShortLinkCreateDTO {
     @NotBlank(message = "原始长链接不能为空")
     @URL(message = "长链接格式不正确，必须包含 http:// 或 https://")
     private String originUrl;
+
+    /**
+     * 有效期天数（可选）。默认 7 天。
+     * 采用「validDays」而非让用户自己算 expireTime 时间点，
+     * 用户无需自行计算过期时刻，后端统一 now + validDays 计算。
+     */
+    @Min(value = 1, message = "有效期天数至少为 1 天")
+    private Integer validDays;
 }

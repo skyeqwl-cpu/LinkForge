@@ -124,6 +124,18 @@ public class ShortLinkController {
         return Result.success(shortLinkService.listShortLinks());
     }
 
+    // 六、阶段 8：分页查询（REST 风格路径，使用 MyBatis-Plus 的 Page<T>）
+    // GET /api/v1/short-links?page=1&size=10
+    @GetMapping("/api/v1/short-links")
+    public Result<PageResult<ShortLinkManageVO>> listShortLinksPage(
+            @RequestParam(required = false, defaultValue = "1") long page,
+            @RequestParam(required = false, defaultValue = "10") long size) {
+
+        PageResult<ShortLinkManageVO> pageResult =
+                shortLinkService.listShortLinksByPage(page, size);
+        return Result.success(pageResult);
+    }
+
     // 阶段 9：删除 / 失效短链接（物理清理 MySQL + 相关 Redis 键）
     @DeleteMapping("/api/v1/short-link/{shortCode}")
     public Result<String> deleteShortLink(
