@@ -1,0 +1,47 @@
+version: '3.8'
+services:
+  # 1. NameServer (路由中心)
+  namesrv:
+    image: apache/rocketmq:5.1.0
+    container_name: rmqnamesrv
+    ports:
+      - "9876:9876"
+    command: sh mqnamesrv
+    networks:
+      - rmnetwork
+
+  # 2. Broker (消息存储与代理)
+  broker:
+    image: apache/rocketmq:5.1.0
+    container_name: rmqbroker
+    ports:
+      - "10909:10909"
+      - "10911:10911"
+      - "10912:10912"
+    environment:
+      - NAMESRV_ADDR=namesrv:9876
+    volumes:
+      - ./broker.conf:/home/rocketmq/rocketmq-5.1.0/conf/broker.conf
+    # 指定加载配置文件的路径启动 broker
+    command: sh mqbroker -c /home/rocketmq/rocketmq-5.1.0/conf/broker.conf
+    depends_on:
+      - namesrv
+    networks:
+      - rmnetwork
+
+  # 3. Dashboard (可视化控制台，方便在浏览器看消息)
+  dashboard:
+    image: apacherocketmq/rocketmq-dashboard:1.0.0
+    container_name: rmqdashboard
+    ports:
+      - "8082:8080"
+    environment:
+      - JAVA_OPTS=-Drocketmq.config.namesrvAddr=namesrv:9876
+    depends_on:
+      - namesrv
+    networks:
+      - rmnetwork
+
+networks:
+  rmnetwork:
+    driver: bridge

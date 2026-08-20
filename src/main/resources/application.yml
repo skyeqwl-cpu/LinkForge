@@ -32,3 +32,8 @@ mybatis:
   type-aliases-package: com.linkforge.entity
   configuration:
     map-underscore-to-camel-case: true
+
+rocketmq:
+  name-server: 127.0.0.1:9876
+  producer:
+    group: linkforge-producer-group

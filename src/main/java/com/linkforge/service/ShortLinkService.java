@@ -7,6 +7,7 @@ import com.linkforge.common.LoginUserContext;
 import com.linkforge.common.PageResult;
 import com.linkforge.dto.ShortLinkCreateDTO;
 import com.linkforge.entity.ShortLink;
+import com.linkforge.event.ShortLinkClickEvent;
 import com.linkforge.exception.BizException;
 import com.linkforge.mapper.ShortLinkMapper;
 import com.linkforge.utils.Base62Utils;
@@ -14,7 +15,9 @@ import com.linkforge.vo.ShortLinkDetailVO;
 import com.linkforge.vo.ShortLinkManageVO;
 import com.linkforge.vo.ShortLinkStatsVO;
 import com.linkforge.vo.ShortLinkVO;
-import jakarta.annotation.PostConstruct;
+import org.apache.rocketmq.client.producer.SendResult;
+import org.apache.rocketmq.client.producer.SendCallback;
+import org.apache.rocketmq.spring.core.RocketMQTemplate;
 import org.redisson.api.RBloomFilter;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
@@ -48,6 +51,9 @@ public class ShortLinkService {
 
     @Autowired
     private Cache<String, String> shortLinkLocalCache;
+
+    @Autowired
+    private RocketMQTemplate rocketMQTemplate;
 
     private static final String SHORT_LINK_KEY_PREFIX = "short_link:";//短链接缓存前缀
     private static final String NULL_VALUE = "__NULL__";
@@ -356,6 +362,20 @@ public class ShortLinkService {
         System.out.println("====== 记录访问 ======");
         System.out.println("shortCode: " + shortCode);
         System.out.println("clickCount: " + count);
+
+        // 2. 异步投递消息至 RocketMQ（不阻塞主跳转流程）
+        ShortLinkClickEvent event = new ShortLinkClickEvent(shortCode, System.currentTimeMillis());
+        rocketMQTemplate.asyncSend("short-link-click-topic", event, new SendCallback() {
+            @Override
+            public void onSuccess(SendResult sendResult) {
+                System.out.println("====== MQ 消息发送成功: " + shortCode + " ======");
+            }
+
+            @Override
+            public void onException(Throwable e) {
+                System.err.println("====== MQ 消息发送失败: " + e.getMessage() + " ======");
+            }
+        });
     }
     /**
      * 将 Redis 点击次数同步到 MySQL
