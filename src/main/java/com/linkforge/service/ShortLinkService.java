@@ -14,6 +14,7 @@ import com.linkforge.vo.ShortLinkManageVO;
 import com.linkforge.vo.ShortLinkStatsVO;
 import com.linkforge.vo.ShortLinkVO;
 import jakarta.annotation.PostConstruct;
+import org.redisson.api.RBloomFilter;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -40,6 +41,9 @@ public class ShortLinkService {
 
     @Autowired
     private RedissonClient redissonClient;
+
+    @Autowired
+    private RBloomFilter<String> shortLinkBloomFilter;
 
     private static final String SHORT_LINK_KEY_PREFIX = "short_link:";//短链接缓存前缀
     private static final String NULL_VALUE = "__NULL__";
@@ -86,6 +90,9 @@ public class ShortLinkService {
         shortLink.setShortCode(shortCode);
         shortLinkMapper.updateById(shortLink);
 
+        // 新增：把生成的 shortCode 写入布隆过滤器
+        shortLinkBloomFilter.add(shortCode);
+
         // 6.5 预热写入 Redis 缓存：TTL = 距过期剩余秒数 + 随机抖动（防雪崩）
         String redisKey = SHORT_LINK_KEY_PREFIX + shortCode;//短链接缓存键
         long ttl = cacheTtlSeconds(expireTime);
@@ -111,6 +118,13 @@ public class ShortLinkService {
 
     // 2. 根据短码获取长网址
     public String getOriginUrl(String shortCode) {
+
+        // 【第一道防线】：布隆过滤器拦截
+        if (!shortLinkBloomFilter.contains(shortCode)) {
+            System.out.println("====== 布隆过滤器拦截：短码一定不存在 ======");
+            System.out.println("shortCode: " + shortCode);
+            throw new BizException(404, "短链接不存在或已失效");
+        }
 
         // 1. Redis Key
         String redisKey = SHORT_LINK_KEY_PREFIX + shortCode;
