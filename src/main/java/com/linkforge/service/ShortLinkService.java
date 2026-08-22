@@ -27,6 +27,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 
+import java.net.URI;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -80,6 +81,11 @@ public class ShortLinkService {
     //   注：当前 Redis 写入仍在 @Transactional 内，Redis 故障会回滚 DB（见 deleteShortLink 注释里的优化点）。
     @Transactional
     public ShortLinkVO createShortLink(ShortLinkCreateDTO dto) {
+        // URL 安全校验：仅允许 http/https 协议、且 host 非空。
+        // @URL 注解已做格式校验，这里再用 URI 做深度防御，
+        // 拦截 javascript:、data:、file: 等危险协议，防止 XSS / 钓鱼短链。
+        validateUrl(dto.getOriginUrl());
+
         // 先插入一条只有 originUrl 的数据，获取自增 ID
         ShortLink shortLink = new ShortLink();
         shortLink.setOriginUrl(dto.getOriginUrl());
@@ -124,6 +130,31 @@ public class ShortLinkService {
                 .originUrl(dto.getOriginUrl())
                 .expireTime(expireTime.format(MANAGE_TIME_FORMATTER))
                 .build();
+    }
+
+    /**
+     * URL 安全校验（深度防御）。
+     * DTO 上的 @URL 注解已做格式校验，这里再用 java.net.URI 做二次校验：
+     * 1. 仅允许 http / https 协议，拦截 javascript:、data:、file:、vbscript: 等危险协议；
+     * 2. host 必须非空，拦截形如 "http://" 的残缺 URL。
+     * 目的：防止攻击者构造危险协议短链，用户点击后触发 XSS / 钓鱼。
+     */
+    private void validateUrl(String url) {
+        URI uri;
+        try {
+            uri = URI.create(url);
+        } catch (IllegalArgumentException e) {
+            throw new BizException(400, "URL 格式不正确");
+        }
+        String scheme = uri.getScheme();
+        if (scheme == null
+                || (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme))) {
+            throw new BizException(400, "仅支持 http / https 协议的 URL");
+        }
+        String host = uri.getHost();
+        if (host == null || host.isBlank()) {
+            throw new BizException(400, "URL 缺少有效的域名");
+        }
     }
 
     // 2. 根据短码获取长网址

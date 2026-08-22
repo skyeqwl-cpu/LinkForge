@@ -2,6 +2,7 @@ package com.linkforge.dto;
 
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
 import lombok.Data;
 import org.hibernate.validator.constraints.URL;
 
@@ -9,7 +10,7 @@ import org.hibernate.validator.constraints.URL;
 public class ShortLinkCreateDTO {
 
     @NotBlank(message = "原始长链接不能为空")
-    @URL(message = "长链接格式不正确，必须包含 http:// 或 https://")
+    @Pattern(regexp = "^https?://.+", message = "长链接格式不正确，必须为 http(s)://域名/... 形式")
     private String originUrl;
 
     /**
