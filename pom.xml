@@ -129,6 +129,13 @@
             <version>2.3.0</version>
         </dependency>
 
+        <!-- 显式锁定 rocketmq-client 版本，与 broker 5.1.0 对齐，避免 starter 传递版本漂移导致 connect to null -->
+        <dependency>
+            <groupId>org.apache.rocketmq</groupId>
+            <artifactId>rocketmq-client</artifactId>
+            <version>5.1.4</version>
+        </dependency>
+
     </dependencies>
 
     <!-- Spring Boot Maven 插件 -->

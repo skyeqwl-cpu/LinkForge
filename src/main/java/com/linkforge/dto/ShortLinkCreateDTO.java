@@ -20,4 +20,12 @@ public class ShortLinkCreateDTO {
      */
     @Min(value = 1, message = "有效期天数至少为 1 天")
     private Integer validDays;
+
+    /**
+     * 访问限制类型（可选）：
+     * 0 = 无限制，任何人可访问（默认，保留原有公开行为）；
+     * 1 = 仅创建者（owner）可访问，其他人需登录且非 owner 将被拒绝。
+     * 不传则视为 0（无限制）。
+     */
+    private Integer accessType;
 }

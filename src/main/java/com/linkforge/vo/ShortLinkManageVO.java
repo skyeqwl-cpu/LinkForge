@@ -42,4 +42,9 @@ public class ShortLinkManageVO {
      * 点击次数
      */
     private Long clickCount;
+
+    /**
+     * 访问类型：0=无限制，1=仅创建者
+     */
+    private Integer accessType;
 }

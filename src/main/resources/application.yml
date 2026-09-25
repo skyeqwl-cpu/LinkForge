@@ -37,3 +37,6 @@ rocketmq:
   name-server: 127.0.0.1:9876
   producer:
     group: linkforge-producer-group
+
+linkforge:
+  admin-user-ids: 4   # 把谁是管理员填进去，逗号分隔

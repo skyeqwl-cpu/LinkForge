@@ -6,6 +6,7 @@ import com.github.benmanes.caffeine.cache.Cache;
 import com.linkforge.common.LoginUserContext;
 import com.linkforge.common.PageResult;
 import com.linkforge.dto.ShortLinkCreateDTO;
+import com.linkforge.config.JwtUtil;
 import com.linkforge.entity.ShortLink;
 import com.linkforge.event.ShortLinkClickEvent;
 import com.linkforge.exception.BizException;
@@ -23,8 +24,10 @@ import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.StringUtils;
 
 
 import java.net.URI;
@@ -33,8 +36,16 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.Arrays;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
+import jakarta.annotation.PostConstruct;
+import jakarta.servlet.http.HttpServletRequest;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
 
 @Service
 public class ShortLinkService {
@@ -56,7 +67,26 @@ public class ShortLinkService {
     @Autowired
     private RocketMQTemplate rocketMQTemplate;
 
+    @Autowired
+    private JwtUtil jwtUtil;
+
+    /**
+     * 管理员用户 ID 白名单（来自配置 linkforge.admin-user-ids，逗号分隔）。
+     * 名单内的用户拥有「最大权限」：访问任何短链（含「仅创建者」可见的私有链）均放行，
+     * 但仍需携带有效登录 token（先证明自己是管理员，再享特权）。
+     * 默认空字符串 → 无管理员，保持原有访问控制行为不变。
+     */
+    @Value("${linkforge.admin-user-ids:}")
+    private String adminUserIdsRaw;
+    private Set<Long> adminUserIds = Set.of();
+
     private static final String SHORT_LINK_KEY_PREFIX = "short_link:";//短链接缓存前缀
+
+    // 访问限制元数据缓存：short_link:meta:{code} = "{accessType}:{ownerId}"，与短链缓存同生命周期
+    private static final String META_KEY_PREFIX = "short_link:meta:";
+    private static final int PUBLIC_CODE = 0;   // 无限制（任何人可访问）
+    private static final int PRIVATE_CODE = 1;  // 仅创建者可访问
+    private static final String BLACKLIST_PREFIX = "jwt:blacklist:"; // 与 JwtInterceptor 黑名单前缀一致
     private static final String NULL_VALUE = "__NULL__";
 
     // 访问统计
@@ -73,6 +103,8 @@ public class ShortLinkService {
 
     // 短链接域名（用于拼装 shortUrl，统一管理避免硬编码散落）
     private static final String SHORT_LINK_DOMAIN = "http://localhost:8081/";
+
+    private static final Logger log = LoggerFactory.getLogger(ShortLinkService.class);
 
     // ==================== 阶段 10：缓存一致性（Cache Aside Pattern） ====================
     // 10.1 创建：MySQL 成功 → 再写 Redis
@@ -91,6 +123,10 @@ public class ShortLinkService {
         shortLink.setOriginUrl(dto.getOriginUrl());
         // 多用户：归属当前登录用户（JWT 拦截器已写入上下文）
         shortLink.setUserId(LoginUserContext.getUserId());
+
+        // 访问限制类型：null → 无限制(PUBLIC_CODE=0)，持久化到 access_type 列
+        int accessType = dto.getAccessType() != null ? dto.getAccessType() : PUBLIC_CODE;
+        shortLink.setAccessType(accessType);
 
         // 6.4 计算过期时间：默认 7 天，用户可传 validDays 覆盖
         int validDays = dto.getValidDays() != null ? dto.getValidDays() : DEFAULT_VALID_DAYS;
@@ -118,6 +154,15 @@ public class ShortLinkService {
         stringRedisTemplate.opsForValue().set(
                 EXPIRE_KEY_PREFIX + shortCode,
                 String.valueOf(toEpochSeconds(expireTime)),
+                ttl,
+                TimeUnit.SECONDS
+        );
+
+        // 6.7 写入访问限制元数据缓存（与短链缓存同 TTL）：让 resolveMeta 直接命中，
+        // 避免首访回源 MySQL；同时确保「仅创建者」权限在创建后即可生效（否则 access_type 恒为 0）。
+        stringRedisTemplate.opsForValue().set(
+                META_KEY_PREFIX + shortCode,
+                AccessMeta.of(accessType, LoginUserContext.getUserId()).toText(),
                 ttl,
                 TimeUnit.SECONDS
         );
@@ -162,8 +207,6 @@ public class ShortLinkService {
 
         // 【第一道防线】：布隆过滤器拦截
         if (!shortLinkBloomFilter.contains(shortCode)) {
-            System.out.println("====== 布隆过滤器拦截：短码一定不存在 ======");
-            System.out.println("shortCode: " + shortCode);
             throw new BizException(404, "短链接不存在或已失效");
         }
 
@@ -171,11 +214,8 @@ public class ShortLinkService {
         String originUrl = shortLinkLocalCache.getIfPresent(shortCode);
         if (originUrl != null) {
             if (NULL_VALUE.equals(originUrl)) {
-                System.out.println("====== L1 Caffeine 命中：空值 ======");
                 throw new BizException(404, "短链接不存在或已失效");
             }
-            System.out.println("====== L1 Caffeine 本地缓存命中 ======");
-            System.out.println("shortCode: " + shortCode + " -> " + originUrl);
             recordAccess(shortCode); // 异步/原子记录访问
             return originUrl;
         }
@@ -193,16 +233,12 @@ public class ShortLinkService {
 
             // 命中空值缓存
             if (NULL_VALUE.equals(originUrl)) {
-                System.out.println("====== Redis 命中：空值 ======");
-                System.out.println("shortCode: " + shortCode);
 
                 throw new BizException(404, "短链接不存在或已失效");
             }
 
             // 6.6 业务层二次过期校验：即使 Redis Key 仍存活，也可能因 TTL 抖动略超期
             if (isExpiredAndClean(shortCode, redisKey)) {
-                System.out.println("====== Redis 命中但已过期 ======");
-                System.out.println("shortCode: " + shortCode);
 
                 throw new BizException(404, "短链接已过期失效");
             }
@@ -212,9 +248,6 @@ public class ShortLinkService {
             // ====================================================
             shortLinkLocalCache.put(shortCode, originUrl);
 
-            System.out.println("====== Redis 命中，已同步回填 L1 Caffeine ======");
-            System.out.println("shortCode: " + shortCode);
-            System.out.println("originUrl: " + originUrl);
             // 记录访问
             recordAccess(shortCode);
 
@@ -222,8 +255,6 @@ public class ShortLinkService {
         }
 
         // 4. Redis 未命中
-        System.out.println("====== Redis 未命中 ======");
-        System.out.println("shortCode: " + shortCode);
 
         // 5. 获取分布式锁
         String lockKey = "lock:short_link:" + shortCode;
@@ -233,20 +264,12 @@ public class ShortLinkService {
 
             // 6. 尝试获取锁
             boolean locked = lock.tryLock(3, 10, TimeUnit.SECONDS);
-            System.out.println("====== 尝试获取分布式锁 ======");
-            System.out.println("shortCode: " + shortCode);
-            System.out.println("线程: " + Thread.currentThread().getName());
 
             if (!locked) {
-                System.out.println("====== 获取分布式锁失败 ======");
-                System.out.println("shortCode: " + shortCode);
 
                 throw new BizException(429, "系统繁忙，请稍后重试");
             }
 
-            System.out.println("====== 成功获取分布式锁 ======");
-            System.out.println("shortCode: " + shortCode);
-            System.out.println("线程: " + Thread.currentThread().getName());
 
             // 7. Double Check
             originUrl = stringRedisTemplate
@@ -255,8 +278,6 @@ public class ShortLinkService {
 
             if (originUrl != null) {
 
-                System.out.println("====== Double Check：Redis 已有数据 ======");
-                System.out.println("shortCode: " + shortCode);
 
                 if (NULL_VALUE.equals(originUrl)) {
                     throw new BizException(404, "短链接不存在或已失效");
@@ -267,7 +288,6 @@ public class ShortLinkService {
                     throw new BizException(404, "短链接已过期失效");
                 }
 
-                System.out.println("originUrl: " + originUrl);
 
                 // 记录访问
                 recordAccess(shortCode);
@@ -276,8 +296,6 @@ public class ShortLinkService {
             }
 
             // 8. Redis 依然没有 → 查询 MySQL
-            System.out.println("====== Redis 未命中，查询 MySQL ======");
-            System.out.println("shortCode: " + shortCode);
 
             LambdaQueryWrapper<ShortLink> wrapper =
                     new LambdaQueryWrapper<>();
@@ -290,8 +308,6 @@ public class ShortLinkService {
             // 9. MySQL 不存在
             if (shortLink == null) {
 
-                System.out.println("====== MySQL 不存在，写入 Redis 空值 ======");
-                System.out.println("shortCode: " + shortCode);
 
                 // 防止缓存穿透
                 stringRedisTemplate.opsForValue()
@@ -311,8 +327,6 @@ public class ShortLinkService {
             // 6.6 过期校验：数据库里已过期 → 视为失效，写短 TTL 空值避免反复打 DB
             if (shortLink.getExpireTime() != null
                     && toEpochSeconds(shortLink.getExpireTime()) <= Instant.now().getEpochSecond()) {
-                System.out.println("====== MySQL 命中但已过期 ======");
-                System.out.println("shortCode: " + shortCode);
 
                 stringRedisTemplate.opsForValue()
                         .set(redisKey, NULL_VALUE, 5, TimeUnit.MINUTES);
@@ -323,9 +337,6 @@ public class ShortLinkService {
             // 10. MySQL 查询成功
             originUrl = shortLink.getOriginUrl();
 
-            System.out.println("====== MySQL 查询成功，写入 Redis ======");
-            System.out.println("shortCode: " + shortCode);
-            System.out.println("originUrl: " + originUrl);
 
             // 写入短链缓存（TTL = 距过期剩余秒数 + 随机抖动，防雪崩）
             long ttl = cacheTtlSeconds(shortLink.getExpireTime());
@@ -371,42 +382,73 @@ public class ShortLinkService {
     }
 
     /**
-     * 记录短链接访问
+     * 记录短链接访问：
+     * 1) Redis 原子自增计数（总量，定时任务批量回写 MySQL，最终一致）
+     * 2) 异步投递点击事件到 RocketMQ（明细，由消费者落库 click_log，幂等去重）
+     * 两者解耦：计数走 Redis 保性能，明细走 MQ 保可靠，互为双保险。
      */
     public void recordAccess(String shortCode) {
 
-        // 1. 访问次数 +1
+        // 1. 访问次数 +1（Redis 是计数真相源）
         String clickCountKey = CLICK_COUNT_KEY_PREFIX + shortCode;
-
-        Long count = stringRedisTemplate
-                .opsForValue()
-                .increment(clickCountKey);
+        Long count = stringRedisTemplate.opsForValue().increment(clickCountKey);
 
         // 2. 记录最后访问时间
         String lastAccessKey = LAST_ACCESS_KEY_PREFIX + shortCode;
-
         stringRedisTemplate.opsForValue().set(
                 lastAccessKey,
                 String.valueOf(System.currentTimeMillis())
         );
 
-        System.out.println("====== 记录访问 ======");
-        System.out.println("shortCode: " + shortCode);
-        System.out.println("clickCount: " + count);
-
-        // 2. 异步投递消息至 RocketMQ（不阻塞主跳转流程）
-        ShortLinkClickEvent event = new ShortLinkClickEvent(shortCode, System.currentTimeMillis());
-        rocketMQTemplate.asyncSend("short-link-click-topic", event, new SendCallback() {
-            @Override
-            public void onSuccess(SendResult sendResult) {
-                System.out.println("====== MQ 消息发送成功: " + shortCode + " ======");
+        // 3. 采集访问上下文（IP / UA），用于点击明细
+        String ip = "unknown";
+        String ua = "unknown";
+        try {
+            ServletRequestAttributes attrs = (ServletRequestAttributes) RequestContextHolder.getRequestAttributes();
+            if (attrs != null) {
+                HttpServletRequest request = attrs.getRequest();
+                ip = getClientIp(request);
+                String header = request.getHeader("User-Agent");
+                if (header != null && !header.isEmpty()) {
+                    ua = header;
+                }
             }
+        } catch (Exception ignored) {
+            // 非 Web 上下文（如单测）忽略
+        }
 
-            @Override
-            public void onException(Throwable e) {
-                System.err.println("====== MQ 消息发送失败: " + e.getMessage() + " ======");
-            }
-        });
+        // 4. 异步投递到 RocketMQ（不阻塞 302 跳转主流程）
+        String eventId = shortCode + ":" + System.nanoTime() + ":" + ThreadLocalRandom.current().nextInt(100000);
+        ShortLinkClickEvent event = new ShortLinkClickEvent(shortCode, System.currentTimeMillis(), ip, ua, eventId);
+        try {
+            rocketMQTemplate.asyncSend("short-link-click-topic", event, new SendCallback() {
+                @Override
+                public void onSuccess(SendResult sendResult) {
+                    log.debug("MQ 点击事件发送成功: {}", shortCode);
+                }
+
+                @Override
+                public void onException(Throwable e) {
+                    log.warn("MQ 点击事件发送失败(不影响跳转): {}", e.getMessage());
+                }
+            });
+        } catch (Exception e) {
+            // MQ 不可用（如 broker 未启动）时静默降级，跳转流程不受影响
+            log.warn("MQ 生产者不可用，点击事件未投递: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 解析客户端真实 IP（兼容反向代理 X-Forwarded-For）
+     */
+    private String getClientIp(HttpServletRequest request) {
+        String ip = request.getHeader("X-Forwarded-For");
+        if (ip == null || ip.isEmpty() || "unknown".equalsIgnoreCase(ip)) {
+            ip = request.getRemoteAddr();
+        } else {
+            ip = ip.split(",")[0].trim();
+        }
+        return ip;
     }
     /**
      * 将 Redis 点击次数同步到 MySQL
@@ -421,16 +463,11 @@ public class ShortLinkService {
                 .get(clickKey);
 
         if (clickValue == null) {
-            System.out.println("====== Redis 没有点击数据 ======");
-            System.out.println("shortCode: " + shortCode);
             return;
         }
 
         long clickCount = Long.parseLong(clickValue);
 
-        System.out.println("====== Redis 点击次数 ======");
-        System.out.println("shortCode: " + shortCode);
-        System.out.println("clickCount: " + clickCount);
 
         // 2. 查询 MySQL
         LambdaQueryWrapper<ShortLink> wrapper =
@@ -442,8 +479,6 @@ public class ShortLinkService {
                 shortLinkMapper.selectOne(wrapper);
 
         if (shortLink == null) {
-            System.out.println("====== MySQL 短链接不存在 ======");
-            System.out.println("shortCode: " + shortCode);
             return;
         }
 
@@ -452,14 +487,10 @@ public class ShortLinkService {
 
         shortLinkMapper.updateById(shortLink);
 
-        System.out.println("====== MySQL 点击次数同步成功 ======");
-        System.out.println("shortCode: " + shortCode);
-        System.out.println("clickCount: " + clickCount);
     }
 
    /* @PostConstruct
     public void test() {
-        System.out.println(redissonClient);
     }*/
     /**
      * 查询短链接访问统计
@@ -720,6 +751,7 @@ public class ShortLinkService {
         // 3. 删除 Redis 相关键
         //    short_link:2 / short_link:click:2 / short_link:last_access:2 / short_link:expire:2
         stringRedisTemplate.delete(SHORT_LINK_KEY_PREFIX + shortCode);
+        stringRedisTemplate.delete(META_KEY_PREFIX + shortCode);
         stringRedisTemplate.delete(CLICK_COUNT_KEY_PREFIX + shortCode);
         stringRedisTemplate.delete(LAST_ACCESS_KEY_PREFIX + shortCode);
         stringRedisTemplate.delete(EXPIRE_KEY_PREFIX + shortCode);
@@ -798,6 +830,131 @@ public class ShortLinkService {
             return true;
         }
         return false;
+    }
+
+    /**
+     * 管理员白名单初始化（配置 linkforge.admin-user-ids，逗号分隔的用户 ID）。
+     * 名单内的用户访问受限短链（仅创建者可见）时绕过 owner 校验 → 最大权限。
+     * 仍要求携带有效 token，避免未登录即获得特权。
+     */
+    @PostConstruct
+    public void initAdminUserIds() {
+        this.adminUserIds = Arrays.stream(adminUserIdsRaw.split(","))
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .map(Long::valueOf)
+                .collect(Collectors.toSet());
+    }
+
+    private boolean isAdmin(Long userId) {
+        return userId != null && adminUserIds.contains(userId);
+    }
+
+    // ==================== 访问限制（公开 / 仅创建者） ====================
+    /**
+     * 带访问控制的跳转解析。
+     * - 无限制(PUBLIC)：任何人可访问（保留原行为）；
+     * - 仅创建者(PRIVATE)：必须登录且为 owner，否则 401/403；
+     * 通过后再走原有布隆/缓存/过期解析并记录访问。
+     */
+    public RedirectResult resolveRedirect(String shortCode, String authHeader) {
+        AccessMeta meta = resolveMeta(shortCode);
+
+        if (meta != null && meta.accessType == PRIVATE_CODE) {
+            Long visitorId = resolveUserIdFromHeader(authHeader);
+            if (visitorId == null) {
+                return RedirectResult.unauthorized();
+            }
+            // 管理员白名单：拥有最大权限，可访问任何短链（含仅创建者可见的），无需是 owner
+            if (!isAdmin(visitorId) && (meta.ownerId == null || !visitorId.equals(meta.ownerId))) {
+                return RedirectResult.forbidden();
+            }
+        }
+
+        try {
+            String originUrl = getOriginUrl(shortCode);
+            return RedirectResult.ok(originUrl);
+        } catch (BizException e) {
+            if (e.getCode() != null && e.getCode() == 404) {
+                return RedirectResult.notFound();
+            }
+            throw e; // 429 / 500 透传给全局异常处理器
+        }
+    }
+
+    /**
+     * 解析短链访问元数据（访问类型 + 创建者 ID）。
+     * 优先读 Redis 元数据缓存；缺失则回源 MySQL 并回填（与短链缓存同 TTL）。
+     * 返回 null 表示短链不存在（DB 也无）。
+     */
+    private AccessMeta resolveMeta(String shortCode) {
+        String metaKey = META_KEY_PREFIX + shortCode;
+        String metaVal = stringRedisTemplate.opsForValue().get(metaKey);
+        if (NULL_VALUE.equals(metaVal)) {
+            return null; // 已知不存在
+        }
+        if (metaVal != null) {
+            return AccessMeta.parse(metaVal);
+        }
+        ShortLink sl = shortLinkMapper.selectOne(
+                new LambdaQueryWrapper<ShortLink>().eq(ShortLink::getShortCode, shortCode));
+        if (sl == null) {
+            stringRedisTemplate.opsForValue().set(metaKey, NULL_VALUE, 5, TimeUnit.MINUTES);
+            return null;
+        }
+        Integer at = sl.getAccessType() != null ? sl.getAccessType() : PUBLIC_CODE;
+        long ttl = cacheTtlSeconds(sl.getExpireTime());
+        stringRedisTemplate.opsForValue()
+                .set(metaKey, AccessMeta.of(at, sl.getUserId()).toText(), ttl, TimeUnit.SECONDS);
+        return AccessMeta.of(at, sl.getUserId());
+    }
+
+    /**
+     * 从 Authorization 头解析当前登录用户 ID，逻辑与 JwtInterceptor 保持一致（含登出黑名单）。
+     * 未登录 / token 失效 / 已登出 → 返回 null（匿名，无法访问受限短链）。
+     */
+    private Long resolveUserIdFromHeader(String authHeader) {
+        if (!StringUtils.hasText(authHeader) || !authHeader.startsWith("Bearer ")) {
+            return null;
+        }
+        String token = authHeader.substring(7).trim();
+        try {
+            Long userId = jwtUtil.parseUserId(token);
+            String jti = jwtUtil.getJti(token);
+            if (Boolean.TRUE.equals(stringRedisTemplate.hasKey(BLACKLIST_PREFIX + jti))) {
+                return null;
+            }
+            return userId;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** 访问元数据：访问类型 + 创建者 ID（缓存文本格式 "{accessType}:{ownerId}"） */
+    private static class AccessMeta {
+        final int accessType;
+        final Long ownerId;
+
+        AccessMeta(int accessType, Long ownerId) {
+            this.accessType = accessType;
+            this.ownerId = ownerId;
+        }
+
+        static AccessMeta of(Integer accessType, Long ownerId) {
+            return new AccessMeta(accessType == null ? PUBLIC_CODE : accessType, ownerId);
+        }
+
+        static AccessMeta parse(String text) {
+            int idx = text.indexOf(':');
+            int at = Integer.parseInt(text.substring(0, idx));
+            String ownerStr = text.substring(idx + 1);
+            Long ownerId = "null".equals(ownerStr) ? null : Long.parseLong(ownerStr);
+            return new AccessMeta(at, ownerId);
+        }
+
+        String toText() {
+            return accessType + ":" + (ownerId == null ? "null" : ownerId);
+        }
     }
 
 }

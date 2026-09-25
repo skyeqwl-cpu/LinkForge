@@ -3,6 +3,7 @@ package com.linkforge.controller;
 import com.linkforge.common.PageResult;
 import com.linkforge.common.Result;
 import com.linkforge.dto.ShortLinkCreateDTO;
+import com.linkforge.service.RedirectResult;
 import com.linkforge.service.ShortLinkService;
 import com.linkforge.utils.Base62Utils;
 import com.linkforge.vo.ShortLinkDetailVO;
@@ -57,22 +58,27 @@ public class ShortLinkController {
        return Result.success(vo);
    }
 
-    //核心 302 重定向跳转接口
+    //核心 302 重定向跳转接口（带访问限制：无限制 / 仅创建者）
     @GetMapping("/{shortCode:[0-9a-zA-Z]+}")
-    public void redirect(@PathVariable String shortCode, HttpServletResponse response)throws IOException {
-       /* //TODD: 后面从Redis/Mysql里面根据shortCode 查出 originUrl
-        String targetUrl = "https://www.baidu.com"; // 假数据测试
-
-        //设置 302 状态码和 Location 响应头
-        response.setStatus(HttpServletResponse.SC_MOVED_TEMPORARILY);
-        response.setHeader("Location", targetUrl);*/
-
-        String originUrl = shortLinkService.getOriginUrl(shortCode);
-        if (originUrl != null) {
-            response.setStatus(HttpServletResponse.SC_MOVED_TEMPORARILY);
-            response.setHeader("Location", originUrl);
-        } else {
-            response.sendError(HttpServletResponse.SC_NOT_FOUND, "短链接不存在或已失效");
+    public void redirect(@PathVariable String shortCode,
+                         @RequestHeader(value = "Authorization", required = false) String authHeader,
+                         HttpServletResponse response) throws IOException {
+        RedirectResult result = shortLinkService.resolveRedirect(shortCode, authHeader);
+        switch (result.getStatus()) {
+            case OK:
+                response.setStatus(HttpServletResponse.SC_MOVED_TEMPORARILY);
+                response.setHeader("Location", result.getOriginUrl());
+                break;
+            case UNAUTHORIZED:
+                response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "该短链接仅创建者可访问，请先登录");
+                break;
+            case FORBIDDEN:
+                response.sendError(HttpServletResponse.SC_FORBIDDEN, "无权访问该短链接");
+                break;
+            case NOT_FOUND:
+            default:
+                response.sendError(HttpServletResponse.SC_NOT_FOUND, "短链接不存在或已失效");
+                break;
         }
     }
     @GetMapping("/api/v1/short-link/{shortCode}/stats")
