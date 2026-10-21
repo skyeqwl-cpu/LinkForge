@@ -1,9 +1,22 @@
 server:
   port: 8081
+  servlet:
+    encoding:
+      charset: UTF-8
+      enabled: true
+      force-response: true
 
 spring:
   application:
     name: linkforge-server
+
+  ai:
+    openai:
+      api-key: sk-ws-H.PPMDEPP.2wBE.MEUCIQCMvTMjE3rBcVMKWVbiMADWEKIR9KKdgYYLhjhyGTBm8AIgNQgqlXhwVZtu0rj_BuoXe8nwwfAJHYd00E73MM9PFCE
+      base-url: https://dashscope.aliyuncs.com/compatible-mode
+      chat:
+        options:
+          model: qwen-plus
 
   datasource:
     url: jdbc:mysql://localhost:3306/linkforge?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai

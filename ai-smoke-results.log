@@ -1,0 +1,7 @@
+{"result":{"error":"Response status code does not indicate success: 401 ().","body":"\r\n{\r\n  \"code\": 401,\r\n  \"msg\": \"\\u8BF7\\u5148\\u767B\\u5F55\",\r\n  \"data\": null\r\n}","status":401},"test":"unauthenticated"}
+{"test":"registration","code":200,"userId":10,"username":"ai_smoke_20261017221209"}
+{"result":{"error":"Response status code does not indicate success: 500 ().","body":"\r\n{\r\n  \"code\": 500,\r\n  \"msg\": \"\\u670D\\u52A1\\u5668\\u5185\\u90E8\\u9519\\u8BEF\",\r\n  \"data\": null\r\n}","status":500},"test":"wrong_content_type"}
+{"result":{"body":"当然可以！请提供以下信息：\n\n1. 您希望缩短的**完整网址**（必须以 `http://` 或 `https://` 开头）  \n2. 您希望该短链接**有效多少天**（至少1天）\n\n我将根据您提供的信息为您创建短链接。","status":200},"test":"missing_parameters"}
+{"result":{"code":200,"msg":"success","data":[]},"test":"before_creation"}
+{"result":{"body":"短链接创建成功！  \n\n- **短链接**：http://localhost:8081/a0  \n- **原网址**：https://www.baidu.com  \n- **有效期至**：2026-10-20 22:12:17（共3天）  \n\n如需创建其他短链接，请随时告诉我。","status":200},"test":"ai_creation"}
+{"result":{"code":200,"msg":"success","data":[{"shortCode":"a0","shortUrl":"http://localhost:8081/a0","originUrl":"https://www.baidu.com","createTime":"2026-10-17 22:12:18","expireTime":"2026-10-20 22:12:18","clickCount":0,"accessType":null}]},"test":"after_creation"}
